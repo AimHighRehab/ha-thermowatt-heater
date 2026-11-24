@@ -16,7 +16,10 @@ MQTT_PASS = os.getenv("MQTT_PASSWORD")
 class MyThermowattBridge:
     API_KEY = "YVjArWssxKH631jv1dnnWOTr6gijsSAGz7rQJ4hJoUNRffxYvbQaMbePBEZalena"
     BASE_URL = "https://myapp-connectivity.com/api/v1"
-    POLL_INTERVAL = 20  # seconds (matches their TimeBeforeNextRefresh)
+    # Thermann/Thermowatt enforce a DAILY request cap per account (shared with the phone app).
+    # Polling every 20s (~4,300 requests/day) exhausts it and locks out the app, so default to 5 min.
+    POLL_INTERVAL = max(60, int(os.getenv("POLL_INTERVAL", "300")))  # seconds
+    LIMIT_BACKOFF = 3600  # seconds to pause after a "daily request limit" response
     STATUS_LOG_INTERVAL = 300  # 5 minutes
 
     def __init__(self):
@@ -31,7 +34,7 @@ class MyThermowattBridge:
         self.success_count = 0
         self.error_count = 0
         self.last_status_log_time = time.time()
-        self.rate_limit_backoff = 0  # 0 = no backoff, 1 = 20s, 2 = 40s, 3+ = 60s
+        self.rate_limit_backoff = 0  # consecutive 429s; interval doubles each time (max 1h)
         self.current_poll_interval = self.POLL_INTERVAL
 
     def _load_config(self):
@@ -237,25 +240,35 @@ class MyThermowattBridge:
             print(f"⚠️  Status injection failed for {serial}: {e}")
 
     def poll_status(self, serial):
-        """Poll status for a device - returns (success, status_code)"""
+        """Poll status for a device - returns (success, status_code).
+        status_code is "LIMIT" when the backend reports the daily request cap was hit."""
         try:
             r = self.request("GET", "/status", serial=serial)
             status_code = r.status_code
-            
+            body = r.text or ""
+
+            if "limit" in body.lower() and "exceed" in body.lower():
+                return (False, "LIMIT")
+            if status_code == 429:
+                return (False, 429)
+
             if status_code == 200:
-                # Parse JSON and add computed heating status
-                status_data = r.json()
-                if 'result' in status_data:
-                    water_heater_sts = int(status_data['result'].get('WaterHeaterSts', 0))
-                    # Heating is active if bit 0 is set (matches manufacturer's app logic)
-                    status_data['result']['heating'] = (water_heater_sts & 1) != 0
-                
+                try:
+                    status_data = r.json()
+                except ValueError:
+                    return (False, "BADJSON")
+                # Only publish real status payloads - never overwrite good data in HA with an error body
+                if not isinstance(status_data.get('result'), dict):
+                    print(f"[WARN] Status response without data: {body[:200]}")
+                    return (False, "NODATA")
+                water_heater_sts = int(status_data['result'].get('WaterHeaterSts', 0))
+                # Heating is active if bit 0 is set (matches manufacturer's app logic)
+                status_data['result']['heating'] = (water_heater_sts & 1) != 0
+
                 # Publish to MQTT with computed field
                 self.mqtt_client.publish(f"P/{serial}/STATUS", json.dumps(status_data), retain=True)
                 return (True, status_code)
-            else:
-                # Return status code for handling in main loop
-                return (False, status_code)
+            return (False, status_code)
         except Exception as e:
             print(f"Poll error for {serial}: {e}")
             return (False, None)
@@ -346,30 +359,29 @@ class MyThermowattBridge:
                     if success:
                         self.success_count += 1
                         # Reset backoff on success
-                        if self.rate_limit_backoff > 0:
+                        if self.rate_limit_backoff > 0 or self.current_poll_interval != self.POLL_INTERVAL:
                             self.rate_limit_backoff = 0
                             self.current_poll_interval = self.POLL_INTERVAL
                     else:
                         self.error_count += 1
-                        if status_code == 429:
-                            # Rate limited - implement exponential backoff
-                            rate_limited = True
+                        if status_code == "LIMIT":
+                            self.current_poll_interval = self.LIMIT_BACKOFF
+                            print(f"[RATE LIMIT] Daily request limit reached - pausing {self.LIMIT_BACKOFF // 60} min")
+                            break
+                        elif status_code == 429:
                             self.rate_limit_backoff += 1
-                            if self.rate_limit_backoff == 1:
-                                self.current_poll_interval = 20
-                            elif self.rate_limit_backoff == 2:
-                                self.current_poll_interval = 40
-                            else:
-                                self.current_poll_interval = 60  # Stick with 60s
+                            self.current_poll_interval = min(self.POLL_INTERVAL * (2 ** self.rate_limit_backoff), self.LIMIT_BACKOFF)
                             print(f"[RATE LIMIT] 429 received, backing off to {self.current_poll_interval}s interval")
-                            break  # Exit device loop, will sleep below
-                        elif status_code is not None:
-                            # Any other error - re-login
+                            break
+                        elif status_code in (401, 403):
+                            # Auth problem - re-login (but never on rate-limit responses)
                             print(f"[ERROR] Got status {status_code}, re-logging in...")
                             try:
                                 self.login()
                             except Exception as e:
                                 print(f"[ERROR] Re-login failed: {e}")
+                        elif status_code is not None:
+                            print(f"[ERROR] Poll returned {status_code}, will retry next interval")
                 
                 # Log status summary every 5 minutes
                 self.log_status_summary()
@@ -382,11 +394,6 @@ class MyThermowattBridge:
                 break
             except Exception as e:
                 print(f"[ERROR] Polling loop error: {e}")
-                # Try to re-login on any unexpected error
-                try:
-                    self.login()
-                except Exception as e2:
-                    print(f"[ERROR] Re-login failed: {e2}")
                 time.sleep(self.current_poll_interval)
         
         self.mqtt_client.disconnect()
